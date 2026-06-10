@@ -143,50 +143,72 @@ def load_paper_positions():
 
 # Minimum confidence to display — matches MIN_CONFIDENCE in main.py
 DISPLAY_MIN_CONFIDENCE = 7
-DISPLAY_ALLOWED_STATUSES = ("elite", "follow")
+SIGNALS_POOL = 300
+SIGNALS_PER_PAGE = 50
 
-def load_recent_signals(limit=50):
+
+def load_all_signals():
+    """Build the 300-entry signal pool. EXIT signals are fetched separately
+    so they are never crowded out by high-volume ENTRY/ADD rows."""
     active_wallets = load_active_wallet_tiers()
-    signals = []
+    rows = []
     try:
         conn = sqlite3.connect(str(DB_PATH), timeout=5)
         cur = conn.cursor()
+
+        # ENTRY/ADD signals for active wallets
         cur.execute("""
             SELECT timestamp, wallet, coin, signal, side,
                    confidence, suggested_allocation, result, price_change
             FROM copy_signals
-            WHERE confidence >= ? OR signal = 'EXIT'
+            WHERE signal != 'EXIT' AND confidence >= ?
             ORDER BY timestamp DESC LIMIT ?
-        """, (DISPLAY_MIN_CONFIDENCE, limit,))
+        """, (DISPLAY_MIN_CONFIDENCE, SIGNALS_POOL))
         for row in cur.fetchall():
             ts, wallet, coin, signal, side, conf, alloc, result, price_change = row
-            if signal != "EXIT" and (wallet or "").strip().lower() not in active_wallets:
+            if (wallet or "").strip().lower() not in active_wallets:
                 continue
-            if signal == "EXIT":
-                if price_change is not None:
-                    pct = float(price_change) * 100
-                    result_label = f"{pct:+.2f}%"
-                    result_cls = "win" if pct > 0 else "loss"
-                else:
-                    result_label = "CLOSED"
-                    result_cls = "pending"
-            else:
-                result_label = (result or "pending").upper()
-                result_cls = (result or "pending").lower()
-            signals.append({
-                "time": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S"),
-                "wallet": (wallet or "")[:10] + "...",
-                "coin": coin,
-                "signal": signal,
-                "side": side,
-                "confidence": conf,
-                "allocation": alloc,
-                "result_label": result_label,
-                "result_cls": result_cls,
-            })
+            rows.append(row)
+
+        # All EXIT signals — no wallet filter, no row cap
+        cur.execute("""
+            SELECT timestamp, wallet, coin, signal, side,
+                   confidence, suggested_allocation, result, price_change
+            FROM copy_signals
+            WHERE signal = 'EXIT'
+            ORDER BY timestamp DESC
+        """)
+        rows.extend(cur.fetchall())
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"load_all_signals error: {e}")
+
+    rows.sort(key=lambda r: r[0], reverse=True)
+
+    signals = []
+    for ts, wallet, coin, signal, side, conf, alloc, result, price_change in rows[:SIGNALS_POOL]:
+        if signal == "EXIT":
+            if price_change is not None:
+                pct = float(price_change) * 100
+                result_label = f"{pct:+.2f}%"
+                result_cls = "win" if pct > 0 else "loss"
+            else:
+                result_label = "CLOSED"
+                result_cls = "pending"
+        else:
+            result_label = (result or "pending").upper()
+            result_cls = (result or "pending").lower()
+        signals.append({
+            "time": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S"),
+            "wallet": (wallet or "")[:10] + "...",
+            "coin": coin,
+            "signal": signal,
+            "side": side,
+            "confidence": conf,
+            "allocation": alloc,
+            "result_label": result_label,
+            "result_cls": result_cls,
+        })
     return signals
 
 
@@ -280,6 +302,11 @@ TEMPLATE = """
   footer { text-align: center; color: var(--muted); font-size: 10px; padding: 16px 0 8px; }
   .logout-btn { font-size: 10px; color: var(--muted); text-decoration: none; letter-spacing: 0.08em; }
   .logout-btn:hover { color: var(--text); }
+  .pager { display: flex; justify-content: center; align-items: center; gap: 16px; padding: 12px 0 4px; }
+  .pager-btn { display: inline-block; color: var(--accent); text-decoration: none; font-size: 20px; line-height: 1; padding: 2px 8px; border-radius: 4px; }
+  .pager-btn:hover { background: var(--border); }
+  .pager-btn.disabled { color: var(--muted); cursor: default; }
+  .pager-info { font-size: 11px; color: var(--muted); letter-spacing: 0.06em; }
 </style>
 </head>
 <body>
@@ -336,12 +363,12 @@ TEMPLATE = """
 </div>
 
 <div class="card">
-  <div class="card-title">Recent Signals</div>
+  <div class="card-title">Signal History · Page {{ page }} of {{ total_pages }}</div>
   <table class="signal-table">
     <thead><tr><th>Time</th><th>Coin</th><th>Signal</th><th>Side</th><th>Conf</th><th>Result</th></tr></thead>
     <tbody>
     {% for s in signals %}
-    <tr class="{{ 'signal-new' if loop.index <= 3 else '' }}">
+    <tr class="{{ 'signal-new' if loop.index <= 3 and page == 1 else '' }}">
       <td style="color:var(--muted);">{{ s.time }}</td>
       <td style="font-weight:600;">{{ s.coin }}</td>
       <td class="sig-{{ s.signal|lower }}">{{ s.signal }}</td>
@@ -352,6 +379,19 @@ TEMPLATE = """
     {% endfor %}
     </tbody>
   </table>
+  <div class="pager">
+    {% if page > 1 %}
+    <a href="/?page={{ page - 1 }}" class="pager-btn">&#8249;</a>
+    {% else %}
+    <span class="pager-btn disabled">&#8249;</span>
+    {% endif %}
+    <span class="pager-info">{{ page }} / {{ total_pages }}</span>
+    {% if page < total_pages %}
+    <a href="/?page={{ page + 1 }}" class="pager-btn">&#8250;</a>
+    {% else %}
+    <span class="pager-btn disabled">&#8250;</span>
+    {% endif %}
+  </div>
 </div>
 
 {% if positions %}
@@ -429,11 +469,18 @@ def logout():
 @app.route("/")
 @require_login
 def index():
+    page = max(1, request.args.get("page", 1, type=int))
+
     account = load_account()
     positions = load_paper_positions()
-    signals = load_recent_signals(50)
+    all_signals = load_all_signals()
     counts = load_wallet_counts()
     total_signals, scored_signals = load_signal_counts()
+
+    total_pages = max(1, (len(all_signals) + SIGNALS_PER_PAGE - 1) // SIGNALS_PER_PAGE)
+    page = min(page, total_pages)
+    start = (page - 1) * SIGNALS_PER_PAGE
+    signals = all_signals[start:start + SIGNALS_PER_PAGE]
 
     realized = account.get("realized_pnl", 0.0)
     cash = account.get("cash", STARTING_EQUITY)
@@ -447,6 +494,7 @@ def index():
         positions=positions, signals=signals,
         counts=counts, total_signals=total_signals,
         scored_signals=scored_signals, now=now,
+        page=page, total_pages=total_pages,
     )
 
 
