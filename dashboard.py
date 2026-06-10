@@ -212,6 +212,29 @@ def load_all_signals():
     return signals
 
 
+def load_open_followed():
+    """Count unique (wallet, coin) pairs with an open ENTRY signal and no EXIT."""
+    active_wallets = load_active_wallet_tiers()
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=5)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(DISTINCT e.wallet || ':' || e.coin)
+            FROM copy_signals e
+            WHERE e.signal = 'ENTRY'
+              AND NOT EXISTS (
+                  SELECT 1 FROM copy_signals x
+                  WHERE x.wallet = e.wallet AND x.coin = e.coin
+                    AND x.signal = 'EXIT' AND x.timestamp >= e.timestamp
+              )
+        """)
+        total = cur.fetchone()[0]
+        conn.close()
+        return total
+    except Exception:
+        return 0
+
+
 def load_signal_counts():
     try:
         conn = sqlite3.connect(str(DB_PATH), timeout=5)
@@ -334,9 +357,9 @@ TEMPLATE = """
       <div class="pnl-sub">of ${{ '%.0f'|format(starting) }} starting</div>
     </div>
     <div class="pnl-item">
-      <label>Wallet Positions</label>
-      <div class="pnl-value neutral" style="font-size:16px;">{{ positions|length }}</div>
-      <div class="pnl-sub">across {{ counts.elite + counts.follow }} wallets</div>
+      <label>Open Followed</label>
+      <div class="pnl-value neutral" style="font-size:16px;">{{ open_followed }}</div>
+      <div class="pnl-sub">ENTRY signals without EXIT</div>
     </div>
     <div class="pnl-item">
       <label>Signals Scored</label>
@@ -477,6 +500,7 @@ def index():
     all_signals = load_all_signals()
     counts = load_wallet_counts()
     total_signals, scored_signals = load_signal_counts()
+    open_followed = load_open_followed()
 
     total_pages = max(1, (len(all_signals) + SIGNALS_PER_PAGE - 1) // SIGNALS_PER_PAGE)
     page = min(page, total_pages)
@@ -496,6 +520,7 @@ def index():
         counts=counts, total_signals=total_signals,
         scored_signals=scored_signals, now=now,
         page=page, total_pages=total_pages,
+        open_followed=open_followed,
     )
 
 
