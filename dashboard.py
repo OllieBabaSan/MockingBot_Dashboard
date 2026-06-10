@@ -213,24 +213,20 @@ def load_all_signals():
 
 
 def load_open_followed():
-    """Count unique (wallet, coin) pairs with an open ENTRY signal and no EXIT."""
+    """Count positions currently held by active (elite/follow) wallets."""
     active_wallets = load_active_wallet_tiers()
     try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=5)
+        db_path = DB_PATH.parent / "positions.db"
+        conn = sqlite3.connect(str(db_path), timeout=5)
         cur = conn.cursor()
-        cur.execute("""
-            SELECT COUNT(DISTINCT e.wallet || ':' || e.coin)
-            FROM copy_signals e
-            WHERE e.signal = 'ENTRY'
-              AND NOT EXISTS (
-                  SELECT 1 FROM copy_signals x
-                  WHERE x.wallet = e.wallet AND x.coin = e.coin
-                    AND x.signal = 'EXIT' AND x.timestamp >= e.timestamp
-              )
-        """)
-        total = cur.fetchone()[0]
+        cur.execute("SELECT wallet, size FROM positions")
+        count = sum(
+            1 for wallet, size in cur.fetchall()
+            if (wallet or "").strip().lower() in active_wallets
+            and float(size or 0) != 0
+        )
         conn.close()
-        return total
+        return count
     except Exception:
         return 0
 
@@ -359,7 +355,7 @@ TEMPLATE = """
     <div class="pnl-item">
       <label>Open Followed</label>
       <div class="pnl-value neutral" style="font-size:16px;">{{ open_followed }}</div>
-      <div class="pnl-sub">ENTRY signals without EXIT</div>
+      <div class="pnl-sub">elite + follow wallets</div>
     </div>
     <div class="pnl-item">
       <label>Signals Scored</label>
