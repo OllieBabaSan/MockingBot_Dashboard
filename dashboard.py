@@ -160,7 +160,7 @@ def load_recent_signals(limit=50):
         """, (DISPLAY_MIN_CONFIDENCE, limit,))
         for row in cur.fetchall():
             ts, wallet, coin, signal, side, conf, alloc, result, price_change = row
-            if (wallet or "").strip().lower() not in active_wallets:
+            if signal != "EXIT" and (wallet or "").strip().lower() not in active_wallets:
                 continue
             if signal == "EXIT":
                 if price_change is not None:
