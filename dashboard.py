@@ -153,15 +153,26 @@ def load_recent_signals(limit=50):
         cur = conn.cursor()
         cur.execute("""
             SELECT timestamp, wallet, coin, signal, side,
-                   confidence, suggested_allocation, result
+                   confidence, suggested_allocation, result, price_change
             FROM copy_signals
-            WHERE confidence >= ?
+            WHERE confidence >= ? OR signal = 'EXIT'
             ORDER BY timestamp DESC LIMIT ?
         """, (DISPLAY_MIN_CONFIDENCE, limit,))
         for row in cur.fetchall():
-            ts, wallet, coin, signal, side, conf, alloc, result = row
+            ts, wallet, coin, signal, side, conf, alloc, result, price_change = row
             if (wallet or "").strip().lower() not in active_wallets:
                 continue
+            if signal == "EXIT":
+                if price_change is not None:
+                    pct = float(price_change) * 100
+                    result_label = f"{pct:+.2f}%"
+                    result_cls = "win" if pct > 0 else "loss"
+                else:
+                    result_label = "CLOSED"
+                    result_cls = "pending"
+            else:
+                result_label = (result or "pending").upper()
+                result_cls = (result or "pending").lower()
             signals.append({
                 "time": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S"),
                 "wallet": (wallet or "")[:10] + "...",
@@ -170,7 +181,8 @@ def load_recent_signals(limit=50):
                 "side": side,
                 "confidence": conf,
                 "allocation": alloc,
-                "result": result or "pending",
+                "result_label": result_label,
+                "result_cls": result_cls,
             })
         conn.close()
     except Exception:
@@ -335,7 +347,7 @@ TEMPLATE = """
       <td class="sig-{{ s.signal|lower }}">{{ s.signal }}</td>
       <td class="side-{{ s.side|lower }}">{{ s.side }}</td>
       <td><span class="conf-badge {{ 'conf-high' if s.confidence >= 8 else 'conf-mid' if s.confidence >= 6 else '' }}">{{ s.confidence }}</span></td>
-      <td class="result-{{ (s.result or 'pending')|lower }}">{{ (s.result or '—')|upper }}</td>
+      <td class="result-{{ s.result_cls }}">{{ s.result_label }}</td>
     </tr>
     {% endfor %}
     </tbody>
