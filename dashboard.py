@@ -42,9 +42,15 @@ def load_account():
         conn = sqlite3.connect(str(DB_PATH), timeout=5)
         cur = conn.cursor()
 
-        # committed capital: ENTRY signals for wallet+coin pairs with no EXIT
+        # Per-wallet budget: divide STARTING_EQUITY equally across active wallets
+        active_wallets = load_active_wallet_tiers()
+        num_wallets = max(len(active_wallets), 1)
+        per_wallet_budget = STARTING_EQUITY / num_wallets
+
+        # Committed capital: sum allocation% × per_wallet_budget for each open ENTRY,
+        # then cap each wallet at its per_wallet_budget so heavy wallets don't overflow
         cur.execute("""
-            SELECT e.wallet, e.coin, e.suggested_allocation
+            SELECT e.wallet, e.suggested_allocation
             FROM copy_signals e
             WHERE e.signal = 'ENTRY'
               AND NOT EXISTS (
@@ -53,11 +59,19 @@ def load_account():
                     AND x.signal = 'EXIT' AND x.timestamp >= e.timestamp
               )
         """)
-        for _wallet, _coin, alloc in cur.fetchall():
-            if alloc and alloc.rstrip('%').replace('.','',1).isdigit():
-                committed += float(alloc.rstrip('%')) / 100 * STARTING_EQUITY
+        wallet_committed = {}
+        for wallet, alloc in cur.fetchall():
+            if (wallet or "").strip().lower() not in active_wallets:
+                continue
+            if alloc and alloc.rstrip('%').replace('.', '', 1).isdigit():
+                pct = float(alloc.rstrip('%')) / 100
+                w = wallet.strip().lower()
+                wallet_committed[w] = wallet_committed.get(w, 0.0) + pct * per_wallet_budget
 
-        # realized PnL from evaluated EXIT signals
+        for wc in wallet_committed.values():
+            committed += min(wc, per_wallet_budget)
+
+        # Realized PnL from evaluated EXIT signals
         cur.execute("""
             SELECT SUM(price_change) FROM copy_signals
             WHERE signal = 'EXIT' AND price_change IS NOT NULL

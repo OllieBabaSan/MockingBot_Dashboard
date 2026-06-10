@@ -1,6 +1,8 @@
 """
 config.py — Shared data path for MockingBot_Dashboard.
 Must match the DATA_DIR in MockingBot/src/utils/config.py
+
+STARTING_EQUITY is defined in dashboard.py and must match STARTING_EQUITY in src/main.py.
 """
 from pathlib import Path
 
