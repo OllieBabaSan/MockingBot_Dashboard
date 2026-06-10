@@ -362,9 +362,8 @@ TEMPLATE = """
       <div class="pnl-sub">of ${{ '%.0f'|format(starting) }} starting</div>
     </div>
     <div class="pnl-item">
-      <label>Open Followed</label>
+      <label>Open Positions</label>
       <div class="pnl-value neutral" style="font-size:16px;">{{ open_followed }}</div>
-      <div class="pnl-sub">elite + follow wallets</div>
     </div>
     <div class="pnl-item">
       <label>Signals Scored</label>
