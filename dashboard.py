@@ -212,22 +212,31 @@ def load_all_signals():
     return signals
 
 
+MAX_POSITIONS_PER_WALLET = 6
+
 def load_open_followed():
-    """Count positions currently held by active (elite/follow) wallets."""
+    """Count top MAX_POSITIONS_PER_WALLET positions by size per active wallet."""
     active_wallets = load_active_wallet_tiers()
     try:
         db_path = DB_PATH.parent / "positions.db"
         conn = sqlite3.connect(str(db_path), timeout=5)
         cur = conn.cursor()
-        cur.execute("SELECT wallet, size FROM positions")
-        count = sum(
-            1 for wallet, size in cur.fetchall()
-            if (wallet or "").strip().lower() in active_wallets
-            and float(size or 0) != 0
-        )
+        cur.execute("SELECT wallet, size FROM positions WHERE size != 0")
+
+        from collections import defaultdict
+        wallet_sizes = defaultdict(list)
+        for wallet, size in cur.fetchall():
+            w = (wallet or "").strip().lower()
+            if w in active_wallets:
+                wallet_sizes[w].append(abs(float(size or 0)))
         conn.close()
-        return count
-    except Exception:
+
+        return sum(
+            min(len(sizes), MAX_POSITIONS_PER_WALLET)
+            for sizes in wallet_sizes.values()
+        )
+    except Exception as e:
+        print(f"load_open_followed error: {e}")
         return 0
 
 
