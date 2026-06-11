@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, render_template_string, request, redirect, url_for, session
+from flask import Flask, render_template_string, request, redirect, url_for, session, send_file
 from config import DB_PATH, WALLET_STATUS, PAPER_POSITIONS, PAPER_ACCOUNT
 
 app = Flask(__name__)
@@ -39,7 +39,7 @@ def load_account():
     committed = 0.0
     realized_pnl = 0.0
     try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=5)
+        conn = sqlite3.connect(str(DB_PATH), timeout=30)
         cur = conn.cursor()
 
         # Per-wallet budget: divide STARTING_EQUITY equally across active wallets
@@ -119,7 +119,7 @@ def load_paper_positions():
     positions = []
     db_path = DB_PATH.parent / "positions.db"
     try:
-        conn = sqlite3.connect(str(db_path), timeout=5)
+        conn = sqlite3.connect(str(db_path), timeout=30)
         cur = conn.cursor()
         cur.execute("SELECT wallet, coin, size, entry_price FROM positions")
         for wallet, coin, size, entry_price in cur.fetchall():
@@ -153,7 +153,7 @@ def load_all_signals():
     active_wallets = load_active_wallet_tiers()
     rows = []
     try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=5)
+        conn = sqlite3.connect(str(DB_PATH), timeout=30)
         cur = conn.cursor()
 
         # ENTRY/ADD signals for active wallets
@@ -219,7 +219,7 @@ def load_open_followed():
     active_wallets = load_active_wallet_tiers()
     try:
         db_path = DB_PATH.parent / "positions.db"
-        conn = sqlite3.connect(str(db_path), timeout=5)
+        conn = sqlite3.connect(str(db_path), timeout=30)
         cur = conn.cursor()
         cur.execute("SELECT wallet, size FROM positions WHERE size != 0")
 
@@ -242,7 +242,7 @@ def load_open_followed():
 
 def load_signal_counts():
     try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=5)
+        conn = sqlite3.connect(str(DB_PATH), timeout=30)
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM copy_signals")
         total = cur.fetchone()[0]
@@ -278,11 +278,15 @@ TEMPLATE = """
     padding: 12px; max-width: 680px; margin: 0 auto;
   }
   header {
-    display: flex; justify-content: space-between; align-items: center;
+    display: flex; flex-direction: column; align-items: center;
     padding: 12px 0 16px; border-bottom: 1px solid var(--border); margin-bottom: 16px;
+    gap: 8px;
   }
-  .logo { font-size: 18px; font-weight: 700; letter-spacing: 0.05em; color: var(--accent); }
-  .logo span { color: var(--elite); }
+  .header-meta { display: flex; justify-content: space-between; width: 100%; align-items: center; }
+  .logo { display: flex; align-items: center; gap: 8px; font-size: 21px; font-weight: 700; letter-spacing: 0.05em; color: #7B3FB0; }
+  .logo img { height: 25px; width: auto; }
+  .logo span { color: #C80000; }
+  .sig-close { color: var(--loss); }
   .refresh-time { font-size: 11px; color: var(--muted); }
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px; margin-bottom: 12px; }
   .card-title { font-size: 10px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 12px; }
@@ -339,8 +343,8 @@ TEMPLATE = """
 </head>
 <body>
 <header>
-  <div class="logo">MOCKING<span>BOT</span></div>
-  <div style="display:flex;align-items:center;gap:16px;">
+  <div class="logo"><img src="/logo.png" alt="MockingBot">MOCKING<span>BOT</span></div>
+  <div class="header-meta">
     <div class="refresh-time">{{ now }} · 30s refresh</div>
     <a href="/logout" class="logout-btn">LOGOUT</a>
   </div>
@@ -357,9 +361,9 @@ TEMPLATE = """
       <div class="pnl-sub">{{ '+' if realized_pct >= 0 else '' }}{{ '%.2f'|format(realized_pct) }}% return</div>
     </div>
     <div class="pnl-item">
-      <label>Cash</label>
-      <div class="pnl-value neutral" style="font-size:16px;">${{ '%.0f'|format(cash) }}</div>
-      <div class="pnl-sub">of ${{ '%.0f'|format(starting) }} starting</div>
+      <label>Account Value</label>
+      <div class="pnl-value {{ 'positive' if (starting + realized) >= starting else 'negative' }}" style="font-size:16px;">${{ '%.0f'|format(starting + realized) }}</div>
+      <div class="pnl-sub">started ${{ '%.0f'|format(starting) }}</div>
     </div>
     <div class="pnl-item">
       <label>Open Positions</label>
@@ -399,7 +403,7 @@ TEMPLATE = """
     <tr class="{{ 'signal-new' if loop.index <= 3 and page == 1 else '' }}">
       <td style="color:var(--muted);">{{ s.time }}</td>
       <td style="font-weight:600;">{{ s.coin }}</td>
-      <td class="sig-{{ s.signal|lower }}">{{ s.signal }}</td>
+      <td class="sig-{{ 'close' if s.signal == 'EXIT' else s.signal|lower }}">{{ 'CLOSE' if s.signal == 'EXIT' else s.signal }}</td>
       <td class="side-{{ s.side|lower }}">{{ s.side }}</td>
       <td><span class="conf-badge {{ 'conf-high' if s.confidence >= 8 else 'conf-mid' if s.confidence >= 6 else '' }}">{{ s.confidence }}</span></td>
       <td class="result-{{ s.result_cls }}">{{ s.result_label }}</td>
@@ -474,6 +478,11 @@ LOGIN_TEMPLATE = """
 </body>
 </html>
 """
+
+
+@app.route("/logo.png")
+def logo():
+    return send_file(Path(__file__).resolve().parent / "logo.png", mimetype="image/png")
 
 
 @app.route("/login", methods=["GET", "POST"])
