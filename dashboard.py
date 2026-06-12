@@ -54,7 +54,7 @@ def load_account():
 
 
 def load_wallet_counts():
-    counts = {"peak_performer": 0, "elite": 0, "follow": 0, "candidate": 0, "probation": 0, "rejected": 0}
+    counts = {"peak_performer": 0, "elite": 0, "follow": 0, "candidate": 0, "probation": 0}
     try:
         with open(WALLET_STATUS, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
@@ -331,7 +331,7 @@ TEMPLATE = """
 <div class="card">
   <div class="card-title">Wallet Tiers</div>
   {% set total_w = counts.peak_performer + counts.elite + counts.follow + counts.candidate + counts.probation %}
-  {% for tier, cls in [('peak_performer','dot-peak_performer'),('elite','dot-elite'),('follow','dot-follow'),('candidate','dot-candidate'),('probation','dot-probation'),('rejected','dot-rejected')] %}
+  {% for tier, cls in [('peak_performer','dot-peak_performer'),('elite','dot-elite'),('follow','dot-follow'),('candidate','dot-candidate'),('probation','dot-probation')] %}
   <div class="tier-row">
     <div class="tier-label">
       <div class="tier-dot {{ cls }}"></div>
