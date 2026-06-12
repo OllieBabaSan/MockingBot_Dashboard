@@ -54,7 +54,7 @@ def load_account():
 
 
 def load_wallet_counts():
-    counts = {"elite": 0, "follow": 0, "candidate": 0, "probation": 0, "rejected": 0}
+    counts = {"peak_performer": 0, "elite": 0, "follow": 0, "candidate": 0, "probation": 0, "rejected": 0}
     try:
         with open(WALLET_STATUS, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
@@ -72,7 +72,7 @@ def load_active_wallet_tiers() -> set:
     try:
         with open(WALLET_STATUS, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                if row.get("status", "").strip().lower() in ("elite", "follow"):
+                if row.get("status", "").strip().lower() in ("elite", "follow", "peak_performer"):
                     active.add(row.get("wallet", "").strip().lower())
     except Exception:
         pass
@@ -216,7 +216,7 @@ TEMPLATE = """
   :root {
     --bg: #0d0f14; --surface: #151820; --border: #1e2330;
     --text: #c8cdd8; --muted: #5a6070;
-    --elite: #f0c040; --follow: #60a8f0; --candidate: #8090a8;
+    --peak_performer: #a78bfa; --elite: #f0c040; --follow: #60a8f0; --candidate: #8090a8;
     --probation: #e07840; --rejected: #a03030;
     --win: #40c878; --loss: #e05050; --accent: #5090e0;
   }
@@ -249,6 +249,7 @@ TEMPLATE = """
   .tier-row:last-child { border-bottom: none; }
   .tier-label { display: flex; align-items: center; gap: 8px; }
   .tier-dot { width: 7px; height: 7px; border-radius: 50%; }
+  .dot-peak_performer { background: var(--peak_performer); }
   .dot-elite { background: var(--elite); }
   .dot-follow { background: var(--follow); }
   .dot-candidate { background: var(--candidate); }
@@ -329,12 +330,12 @@ TEMPLATE = """
 
 <div class="card">
   <div class="card-title">Wallet Tiers</div>
-  {% set total_w = counts.elite + counts.follow + counts.candidate + counts.probation %}
-  {% for tier, cls in [('elite','dot-elite'),('follow','dot-follow'),('candidate','dot-candidate'),('probation','dot-probation'),('rejected','dot-rejected')] %}
+  {% set total_w = counts.peak_performer + counts.elite + counts.follow + counts.candidate + counts.probation %}
+  {% for tier, cls in [('peak_performer','dot-peak_performer'),('elite','dot-elite'),('follow','dot-follow'),('candidate','dot-candidate'),('probation','dot-probation'),('rejected','dot-rejected')] %}
   <div class="tier-row">
     <div class="tier-label">
       <div class="tier-dot {{ cls }}"></div>
-      <span style="text-transform:uppercase;font-size:11px;letter-spacing:0.06em;">{{ tier }}</span>
+      <span style="text-transform:uppercase;font-size:11px;letter-spacing:0.06em;">{{ tier|replace('_', ' ') }}</span>
     </div>
     <div class="tier-bar-wrap">
       <div class="tier-bar" style="width:{{ ((counts[tier]/(total_w or 1))*100)|int }}%;background:var(--{{ tier }});"></div>
