@@ -11,11 +11,12 @@ import csv
 import sqlite3
 import hashlib
 import secrets
+from collections import defaultdict
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, render_template_string, request, redirect, url_for, session, send_file
+from flask import Flask, render_template_string, request, redirect, url_for, session, send_file, jsonify
 from config import DB_PATH, WALLET_STATUS, PAPER_POSITIONS, PAPER_ACCOUNT
 
 app = Flask(__name__)
@@ -35,63 +36,27 @@ def require_login(f):
     return decorated
 
 
+# ---------------------------------------------------------------------------
+# Data loaders
+# ---------------------------------------------------------------------------
+
 def load_account():
-    committed = 0.0
-    realized_pnl = 0.0
+    """Read cash and realized PnL from paper_account.csv (written by paper_account.py)."""
     try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=30)
-        cur = conn.cursor()
-
-        # Per-wallet budget: divide STARTING_EQUITY equally across active wallets
-        active_wallets = load_active_wallet_tiers()
-        num_wallets = max(len(active_wallets), 1)
-        per_wallet_budget = STARTING_EQUITY / num_wallets
-
-        # Committed capital: sum allocation% × per_wallet_budget for each open ENTRY,
-        # then cap each wallet at its per_wallet_budget so heavy wallets don't overflow
-        cur.execute("""
-            SELECT e.wallet, e.suggested_allocation
-            FROM copy_signals e
-            WHERE e.signal = 'ENTRY'
-              AND NOT EXISTS (
-                  SELECT 1 FROM copy_signals x
-                  WHERE x.wallet = e.wallet AND x.coin = e.coin
-                    AND x.signal = 'EXIT' AND x.timestamp >= e.timestamp
-              )
-        """)
-        wallet_committed = {}
-        for wallet, alloc in cur.fetchall():
-            if (wallet or "").strip().lower() not in active_wallets:
-                continue
-            if alloc and alloc.rstrip('%').replace('.', '', 1).isdigit():
-                pct = float(alloc.rstrip('%')) / 100
-                w = wallet.strip().lower()
-                wallet_committed[w] = wallet_committed.get(w, 0.0) + pct * per_wallet_budget
-
-        for wc in wallet_committed.values():
-            committed += min(wc, per_wallet_budget)
-
-        # Realized PnL from evaluated EXIT signals
-        cur.execute("""
-            SELECT SUM(price_change) FROM copy_signals
-            WHERE signal = 'EXIT' AND price_change IS NOT NULL
-        """)
-        row = cur.fetchone()
-        if row and row[0] is not None:
-            realized_pnl = float(row[0]) * STARTING_EQUITY
-
-        conn.close()
-    except Exception as e:
-        print(f"load_account error: {e}")
-
-    available_cash = max(0.0, STARTING_EQUITY - committed)
-    return {"cash": available_cash, "realized_pnl": realized_pnl}
+        with open(PAPER_ACCOUNT, newline="") as f:
+            for row in csv.DictReader(f):
+                cash = float(row.get("cash") or STARTING_EQUITY)
+                realized_pnl = float(row.get("realized_pnl") or 0.0)
+                return {"cash": cash, "realized_pnl": realized_pnl}
+    except Exception:
+        pass
+    return {"cash": STARTING_EQUITY, "realized_pnl": 0.0}
 
 
 def load_wallet_counts():
     counts = {"elite": 0, "follow": 0, "candidate": 0, "probation": 0, "rejected": 0}
     try:
-        with open(WALLET_STATUS, newline="") as f:
+        with open(WALLET_STATUS, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 status = row.get("status", "candidate").strip()
                 if status in counts:
@@ -102,10 +67,10 @@ def load_wallet_counts():
 
 
 def load_active_wallet_tiers() -> set:
-    """Return the set of wallet addresses that are elite or follow."""
+    """Return wallet addresses that are elite or follow."""
     active = set()
     try:
-        with open(WALLET_STATUS, newline="") as f:
+        with open(WALLET_STATUS, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 if row.get("status", "").strip().lower() in ("elite", "follow"):
                     active.add(row.get("wallet", "").strip().lower())
@@ -115,89 +80,83 @@ def load_active_wallet_tiers() -> set:
 
 
 def load_paper_positions():
+    """
+    Load paper positions from paper_positions.csv.
+    Schema: wallet, coin, side, size, entry_price, pnl, cost_basis
+    Only shows positions for elite/follow wallets.
+    """
     active_wallets = load_active_wallet_tiers()
     positions = []
-    db_path = DB_PATH.parent / "positions.db"
     try:
-        conn = sqlite3.connect(str(db_path), timeout=30)
-        cur = conn.cursor()
-        cur.execute("SELECT wallet, coin, size, entry_price FROM positions")
-        for wallet, coin, size, entry_price in cur.fetchall():
-            if wallet.strip().lower() not in active_wallets:
-                continue
-            size = float(size or 0)
-            if size == 0:
-                continue
-            positions.append({
-                "wallet": wallet,
-                "coin": coin,
-                "size": abs(size),
-                "entry_price": entry_price,
-                "side": "LONG" if size > 0 else "SHORT",
-            })
-        conn.close()
+        with open(PAPER_POSITIONS, newline="") as f:
+            for row in csv.DictReader(f):
+                wallet = (row.get("wallet") or "").strip().lower()
+                if wallet not in active_wallets:
+                    continue
+                size = float(row.get("size") or 0)
+                if size <= 0:
+                    continue
+                positions.append({
+                    "wallet": wallet,
+                    "coin": row.get("coin", ""),
+                    "side": row.get("side", "LONG"),
+                    "size": size,
+                    "entry_price": float(row.get("entry_price") or 0),
+                    "pnl": float(row.get("pnl") or 0),
+                })
     except Exception as e:
         print(f"load_paper_positions error: {e}")
     return positions
 
 
-# Minimum confidence to display — matches MIN_CONFIDENCE in main.py
-DISPLAY_MIN_CONFIDENCE = 7
 SIGNALS_POOL = 300
 SIGNALS_PER_PAGE = 50
 
 
 def load_all_signals():
-    """Build the 300-entry signal pool. EXIT signals are fetched separately
-    so they are never crowded out by high-volume ENTRY/ADD rows."""
+    """
+    Build the 300-entry signal pool.
+    All signal types filtered to elite/follow wallets only — no confidence floor.
+    """
     active_wallets = load_active_wallet_tiers()
+    if not active_wallets:
+        return []
+
+    placeholders = ",".join("?" * len(active_wallets))
     rows = []
     try:
         conn = sqlite3.connect(str(DB_PATH), timeout=30)
         cur = conn.cursor()
 
-        # ENTRY/ADD signals for active wallets
-        cur.execute("""
+        cur.execute(f"""
             SELECT timestamp, wallet, coin, signal, side,
                    confidence, suggested_allocation, result, price_change
             FROM copy_signals
-            WHERE signal != 'EXIT' AND confidence >= ?
+            WHERE wallet IN ({placeholders})
             ORDER BY timestamp DESC LIMIT ?
-        """, (DISPLAY_MIN_CONFIDENCE, SIGNALS_POOL))
-        for row in cur.fetchall():
-            ts, wallet, coin, signal, side, conf, alloc, result, price_change = row
-            if (wallet or "").strip().lower() not in active_wallets:
-                continue
-            rows.append(row)
-
-        # All EXIT signals — no wallet filter, no row cap
-        cur.execute("""
-            SELECT timestamp, wallet, coin, signal, side,
-                   confidence, suggested_allocation, result, price_change
-            FROM copy_signals
-            WHERE signal = 'EXIT'
-            ORDER BY timestamp DESC
-        """)
-        rows.extend(cur.fetchall())
+        """, (*active_wallets, SIGNALS_POOL))
+        rows = cur.fetchall()
         conn.close()
     except Exception as e:
         print(f"load_all_signals error: {e}")
 
-    rows.sort(key=lambda r: r[0], reverse=True)
-
     signals = []
-    for ts, wallet, coin, signal, side, conf, alloc, result, price_change in rows[:SIGNALS_POOL]:
+    for ts, wallet, coin, signal, side, conf, alloc, result, price_change in rows:
         if signal == "EXIT":
             if price_change is not None:
                 pct = float(price_change) * 100
                 result_label = f"{pct:+.2f}%"
                 result_cls = "win" if pct > 0 else "loss"
+            elif result in ("WIN", "LOSS"):
+                result_label = result
+                result_cls = result.lower()
             else:
                 result_label = "CLOSED"
                 result_cls = "pending"
         else:
             result_label = (result or "pending").upper()
             result_cls = (result or "pending").lower()
+
         signals.append({
             "time": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S"),
             "wallet": (wallet or "")[:10] + "...",
@@ -212,32 +171,19 @@ def load_all_signals():
     return signals
 
 
-MAX_POSITIONS_PER_WALLET = 6
-
-def load_open_followed():
-    """Count top MAX_POSITIONS_PER_WALLET positions by size per active wallet."""
+def load_open_position_count():
+    """Count open paper positions for active wallets."""
     active_wallets = load_active_wallet_tiers()
+    count = 0
     try:
-        db_path = DB_PATH.parent / "positions.db"
-        conn = sqlite3.connect(str(db_path), timeout=30)
-        cur = conn.cursor()
-        cur.execute("SELECT wallet, size FROM positions WHERE size != 0")
-
-        from collections import defaultdict
-        wallet_sizes = defaultdict(list)
-        for wallet, size in cur.fetchall():
-            w = (wallet or "").strip().lower()
-            if w in active_wallets:
-                wallet_sizes[w].append(abs(float(size or 0)))
-        conn.close()
-
-        return sum(
-            min(len(sizes), MAX_POSITIONS_PER_WALLET)
-            for sizes in wallet_sizes.values()
-        )
-    except Exception as e:
-        print(f"load_open_followed error: {e}")
-        return 0
+        with open(PAPER_POSITIONS, newline="") as f:
+            for row in csv.DictReader(f):
+                wallet = (row.get("wallet") or "").strip().lower()
+                if wallet in active_wallets and float(row.get("size") or 0) > 0:
+                    count += 1
+    except Exception:
+        pass
+    return count
 
 
 def load_signal_counts():
@@ -254,13 +200,16 @@ def load_signal_counts():
         return 0, 0
 
 
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+
 TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<meta http-equiv="refresh" content="30">
 <title>MockingBot</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -284,9 +233,8 @@ TEMPLATE = """
   }
   .header-meta { display: flex; justify-content: space-between; width: 100%; align-items: center; }
   .logo { display: flex; align-items: center; gap: 8px; font-size: 21px; font-weight: 700; letter-spacing: 0.05em; color: #7B3FB0; }
-  .logo img { height: 25px; width: auto; }
+  .logo img { height: 76px; width: auto; }
   .logo span { color: #C80000; }
-  .sig-close { color: var(--loss); }
   .refresh-time { font-size: 11px; color: var(--muted); }
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px; margin-bottom: 12px; }
   .card-title { font-size: 10px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 12px; }
@@ -312,7 +260,7 @@ TEMPLATE = """
   .signal-table { width: 100%; border-collapse: collapse; font-size: 11px; }
   .signal-table th { text-align: left; color: var(--muted); font-weight: 500; padding: 0 6px 8px 0; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; }
   .signal-table td { padding: 5px 6px 5px 0; border-top: 1px solid var(--border); }
-  .sig-entry { color: var(--win); } .sig-exit { color: var(--loss); }
+  .sig-entry { color: var(--win); } .sig-close { color: var(--loss); }
   .sig-add { color: var(--follow); } .sig-reduce { color: var(--elite); }
   .side-long { color: var(--win); } .side-short { color: var(--loss); }
   .result-win { color: var(--win); font-weight: 600; }
@@ -329,8 +277,10 @@ TEMPLATE = """
   .signal-new td { animation: signal-flash 1s ease-out; }
   .position-row { display: flex; justify-content: space-between; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
   .position-row:last-child { border-bottom: none; }
+  .pos-left { flex: 1; }
   .pos-coin { font-weight: 600; }
   .pos-meta { color: var(--muted); font-size: 10px; margin-top: 2px; }
+  .pos-pnl { font-size: 11px; font-weight: 600; margin-top: 2px; }
   footer { text-align: center; color: var(--muted); font-size: 10px; padding: 16px 0 8px; }
   .logout-btn { font-size: 10px; color: var(--muted); text-decoration: none; letter-spacing: 0.08em; }
   .logout-btn:hover { color: var(--text); }
@@ -345,7 +295,7 @@ TEMPLATE = """
 <header>
   <div class="logo"><img src="/logo.png" alt="MockingBot">MOCKING<span>BOT</span></div>
   <div class="header-meta">
-    <div class="refresh-time">{{ now }} · 30s refresh</div>
+    <div class="refresh-time" id="refresh-ts">{{ now }} · 30s refresh</div>
     <a href="/logout" class="logout-btn">LOGOUT</a>
   </div>
 </header>
@@ -355,24 +305,24 @@ TEMPLATE = """
   <div class="pnl-grid">
     <div class="pnl-item">
       <label>Realized PnL</label>
-      <div class="pnl-value {{ 'positive' if realized >= 0 else 'negative' }}">
+      <div id="pnl-realized" class="pnl-value {{ 'positive' if realized >= 0 else 'negative' }}">
         {{ '+' if realized >= 0 else '' }}${{ '%.2f'|format(realized) }}
       </div>
-      <div class="pnl-sub">{{ '+' if realized_pct >= 0 else '' }}{{ '%.2f'|format(realized_pct) }}% return</div>
+      <div id="pnl-realized-pct" class="pnl-sub">{{ '+' if realized_pct >= 0 else '' }}{{ '%.2f'|format(realized_pct) }}% return</div>
     </div>
     <div class="pnl-item">
       <label>Account Value</label>
-      <div class="pnl-value {{ 'positive' if (starting + realized) >= starting else 'negative' }}" style="font-size:16px;">${{ '%.0f'|format(starting + realized) }}</div>
+      <div id="pnl-account" class="pnl-value {{ 'positive' if (starting + realized) >= starting else 'negative' }}" style="font-size:16px;">${{ '%.0f'|format(starting + realized) }}</div>
       <div class="pnl-sub">started ${{ '%.0f'|format(starting) }}</div>
     </div>
     <div class="pnl-item">
       <label>Open Positions</label>
-      <div class="pnl-value neutral" style="font-size:16px;">{{ open_followed }}</div>
+      <div id="pnl-positions" class="pnl-value neutral" style="font-size:16px;">{{ open_count }}</div>
     </div>
     <div class="pnl-item">
       <label>Signals Scored</label>
-      <div class="pnl-value neutral" style="font-size:16px;">{{ scored_signals }}</div>
-      <div class="pnl-sub">of {{ total_signals }} logged</div>
+      <div id="pnl-scored" class="pnl-value neutral" style="font-size:16px;">{{ scored_signals }}</div>
+      <div id="pnl-total" class="pnl-sub">of {{ total_signals }} logged</div>
     </div>
   </div>
 </div>
@@ -398,7 +348,7 @@ TEMPLATE = """
   <div class="card-title">Signal History · Page {{ page }} of {{ total_pages }}</div>
   <table class="signal-table">
     <thead><tr><th>Time</th><th>Coin</th><th>Signal</th><th>Side</th><th>Conf</th><th>Result</th></tr></thead>
-    <tbody>
+    <tbody id="signals-body">
     {% for s in signals %}
     <tr class="{{ 'signal-new' if loop.index <= 3 and page == 1 else '' }}">
       <td style="color:var(--muted);">{{ s.time }}</td>
@@ -431,9 +381,12 @@ TEMPLATE = """
   <div class="card-title">Open Positions ({{ positions|length }})</div>
   {% for p in positions %}
   <div class="position-row">
-    <div>
+    <div class="pos-left">
       <div class="pos-coin">{{ p.coin }} <span class="side-{{ p.side|lower }}" style="font-size:11px;">{{ p.side }}</span></div>
       <div class="pos-meta">entry {{ p.entry_price }}</div>
+      {% if p.pnl != 0 %}
+      <div class="pos-pnl {{ 'side-long' if p.pnl >= 0 else 'side-short' }}">{{ '+' if p.pnl >= 0 else '' }}{{ '%.2f'|format(p.pnl) }} PnL</div>
+      {% endif %}
     </div>
     <div style="text-align:right;font-size:10px;color:var(--muted);">{{ p.wallet[:10] }}...</div>
   </div>
@@ -442,6 +395,80 @@ TEMPLATE = """
 {% endif %}
 
 <footer>MockingBot · {{ now }}</footer>
+<script>
+(function() {
+  var currentPage = {{ page }};
+
+  function confClass(c) {
+    return c >= 8 ? 'conf-high' : c >= 6 ? 'conf-mid' : '';
+  }
+
+  function renderSignals(signals) {
+    var tbody = document.getElementById('signals-body');
+    if (!tbody) return;
+    tbody.innerHTML = signals.map(function(s, i) {
+      var sigCls = s.signal === 'EXIT' ? 'sig-close' : 'sig-' + s.signal.toLowerCase();
+      var sigLabel = s.signal === 'EXIT' ? 'CLOSE' : s.signal;
+      var rowCls = (i < 3 && currentPage === 1) ? 'signal-new' : '';
+      return '<tr class="' + rowCls + '">' +
+        '<td style="color:var(--muted);">' + s.time + '</td>' +
+        '<td style="font-weight:600;">' + s.coin + '</td>' +
+        '<td class="' + sigCls + '">' + sigLabel + '</td>' +
+        '<td class="side-' + s.side.toLowerCase() + '">' + s.side + '</td>' +
+        '<td><span class="conf-badge ' + confClass(s.confidence) + '">' + s.confidence + '</span></td>' +
+        '<td class="result-' + s.result_cls + '">' + s.result_label + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function setText(id, val) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = val;
+  }
+
+  function setClass(id, cls) {
+    var el = document.getElementById(id);
+    if (el) { el.className = el.className.replace(/\b(positive|negative|neutral)\b/g, '').trim() + ' ' + cls; }
+  }
+
+  function refreshAccount() {
+    fetch('/api/account', {credentials: 'same-origin'})
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(d) {
+        if (!d) return;
+        var sign = d.realized >= 0 ? '+' : '';
+        setText('pnl-realized', sign + '$' + d.realized.toFixed(2));
+        setClass('pnl-realized', d.realized >= 0 ? 'positive' : 'negative');
+        setText('pnl-realized-pct', (d.realized_pct >= 0 ? '+' : '') + d.realized_pct.toFixed(2) + '% return');
+        setText('pnl-account', '$' + Math.round(d.account_value));
+        setClass('pnl-account', d.account_value >= {{ starting }} ? 'positive' : 'negative');
+        setText('pnl-positions', d.open_count);
+        setText('pnl-scored', d.scored_signals);
+        setText('pnl-total', 'of ' + d.total_signals + ' logged');
+      })
+      .catch(function() {});
+  }
+
+  function refreshSignals() {
+    fetch('/api/signals?page=' + currentPage, {credentials: 'same-origin'})
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        if (!data) return;
+        renderSignals(data.signals);
+        var ts = document.getElementById('refresh-ts');
+        if (ts) {
+          var hms = new Date().toUTCString().match(/(\\d{2}:\\d{2}:\\d{2})/);
+          ts.textContent = (hms ? hms[1] : '') + ' UTC · 30s refresh';
+        }
+      })
+      .catch(function() {});
+  }
+
+  function refresh() { refreshAccount(); refreshSignals(); }
+
+  setInterval(refresh, 30000);
+})();
+</script>
 </body>
 </html>
 """
@@ -457,8 +484,8 @@ LOGIN_TEMPLATE = """
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0d0f14; color: #c8cdd8; font-family: 'SF Mono','Fira Code',monospace; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; }
   .card { background: #151820; border: 1px solid #1e2330; border-radius: 8px; padding: 32px; width: 100%; max-width: 320px; }
-  .logo { font-size: 20px; font-weight: 700; color: #5090e0; margin-bottom: 24px; letter-spacing: 0.05em; }
-  .logo span { color: #f0c040; }
+  .logo { font-size: 20px; font-weight: 700; color: #7B3FB0; margin-bottom: 24px; letter-spacing: 0.05em; }
+  .logo span { color: #C80000; }
   input[type=password] { width: 100%; background: #0d0f14; border: 1px solid #1e2330; border-radius: 4px; color: #c8cdd8; font-family: inherit; font-size: 14px; padding: 10px 12px; margin-bottom: 12px; outline: none; }
   input[type=password]:focus { border-color: #5090e0; }
   button { width: 100%; background: #5090e0; border: none; border-radius: 4px; color: #fff; font-family: inherit; font-size: 13px; font-weight: 600; letter-spacing: 0.08em; padding: 10px; cursor: pointer; text-transform: uppercase; }
@@ -480,9 +507,46 @@ LOGIN_TEMPLATE = """
 """
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/api/account")
+@require_login
+def api_account():
+    account = load_account()
+    total_signals, scored_signals = load_signal_counts()
+    open_count = load_open_position_count()
+    realized = account.get("realized_pnl", 0.0)
+    realized_pct = (realized / STARTING_EQUITY) * 100
+    return jsonify({
+        "realized": realized,
+        "realized_pct": realized_pct,
+        "account_value": STARTING_EQUITY + realized,
+        "open_count": open_count,
+        "scored_signals": scored_signals,
+        "total_signals": total_signals,
+    })
+
+
+@app.route("/api/signals")
+@require_login
+def api_signals():
+    page = max(1, request.args.get("page", 1, type=int))
+    all_signals = load_all_signals()
+    total_pages = max(1, (len(all_signals) + SIGNALS_PER_PAGE - 1) // SIGNALS_PER_PAGE)
+    page = min(page, total_pages)
+    start = (page - 1) * SIGNALS_PER_PAGE
+    return jsonify({
+        "signals": all_signals[start:start + SIGNALS_PER_PAGE],
+        "page": page,
+        "total_pages": total_pages,
+    })
+
+
 @app.route("/logo.png")
 def logo():
-    return send_file(Path(__file__).resolve().parent / "logo.png", mimetype="image/png")
+    return send_file(Path(__file__).parent / "logo.png", mimetype="image/png")
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -513,7 +577,7 @@ def index():
     all_signals = load_all_signals()
     counts = load_wallet_counts()
     total_signals, scored_signals = load_signal_counts()
-    open_followed = load_open_followed()
+    open_count = load_open_position_count()
 
     total_pages = max(1, (len(all_signals) + SIGNALS_PER_PAGE - 1) // SIGNALS_PER_PAGE)
     page = min(page, total_pages)
@@ -521,19 +585,18 @@ def index():
     signals = all_signals[start:start + SIGNALS_PER_PAGE]
 
     realized = account.get("realized_pnl", 0.0)
-    cash = account.get("cash", STARTING_EQUITY)
     realized_pct = (realized / STARTING_EQUITY) * 100
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
     return render_template_string(
         TEMPLATE,
         realized=realized, realized_pct=realized_pct,
-        cash=cash, starting=STARTING_EQUITY,
+        starting=STARTING_EQUITY,
         positions=positions, signals=signals,
         counts=counts, total_signals=total_signals,
         scored_signals=scored_signals, now=now,
         page=page, total_pages=total_pages,
-        open_followed=open_followed,
+        open_count=open_count,
     )
 
 
