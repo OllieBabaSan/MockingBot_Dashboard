@@ -313,7 +313,7 @@ TEMPLATE = """
     </div>
     <div class="pnl-item">
       <label>Account Value</label>
-      <div id="pnl-account" class="pnl-value {{ 'positive' if (starting + realized) >= starting else 'negative' }}" style="font-size:16px;">${{ '%.0f'|format(starting + realized) }}</div>
+      <div id="pnl-account" class="pnl-value {{ 'positive' if realized >= 0 else 'negative' }}" style="font-size:16px;">${{ '%.0f'|format(starting + realized) }}</div>
       <div class="pnl-sub">started ${{ '%.0f'|format(starting) }}</div>
     </div>
     <div class="pnl-item">
@@ -467,6 +467,7 @@ TEMPLATE = """
 
   function refresh() { refreshAccount(); refreshSignals(); }
 
+  refresh();
   setInterval(refresh, 30000);
 })();
 </script>
