@@ -110,7 +110,7 @@ def load_paper_positions():
 
 
 SIGNALS_POOL = 300
-SIGNALS_PER_PAGE = 50
+SIGNALS_PER_PAGE = 25
 
 
 def load_all_signals():
